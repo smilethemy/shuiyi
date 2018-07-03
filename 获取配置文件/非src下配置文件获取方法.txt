@@ -1,0 +1,17 @@
+public static String getProValue(String pathName,String key){
+		Properties properties = new Properties();
+		String val = null;
+		try {
+			InputStream in = new BufferedInputStream(new FileInputStream(pathName));
+			properties.load(in);
+			val = properties.getProperty(key);
+		} catch (FileNotFoundException e) {
+			e.printStackTrace();
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		return val;
+	}
+	public static void main(String[] args) {
+		getProValue("bi_url.properties","bi.ay_ajlb_url");
+	}
