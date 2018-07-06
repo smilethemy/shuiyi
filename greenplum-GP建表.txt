@@ -1,0 +1,344 @@
+与其它关系型数据库一样，二维表同样是GP中最重要的存储数据对象。只不过为了更好的支持数据仓库海量数据的访问，GP在表这个层面为我们提供了更多更好的选项。
+从数据存储方式上看，GP的表可以分成面向行存储的普通堆积表和面向列存储的AOT表(APPEND ONLY TABLE)（当然AOT表也可以是按行存储的，但是按列存储必须是AOT表）。
+这样，我们在设计应用上可以获得相当的灵活性。比如经常需要更新的数据，或者较小的维度数据，应该使用普通堆积表存储。下面是两个创建普通堆积表的例子。
+
+例子一
+CREATE TABLE SALES 
+(PROD_ID numeric NOT NULL , 
+        CUST_ID numeric NOT NULL , 
+        TIME_ID DATE NOT NULL , 
+        CHANNEL_ID numeric NOT NULL , 
+        PROMO_ID numeric NOT NULL , 
+        QUANTITY_SOLD numeric(10,2) NOT NULL , 
+        AMOUNT_SOLD numeric(10,2) NOT NULL)
+distributed by (prod_id,cust_id,time_id,channel_id,promo_id);
+
+例子二
+CREATE TABLE SALES 
+  (PROD_ID numeric NOT NULL , 
+         CUST_ID numeric NOT NULL , 
+         TIME_ID DATE NOT NULL , 
+         CHANNEL_ID numeric NOT NULL , 
+         PROMO_ID numeric NOT NULL , 
+         QUANTITY_SOLD numeric(10,2) NOT NULL , 
+         AMOUNT_SOLD numeric(10,2) NOT NULL)
+distributed randomly;
+
+与其它数据库相比，GP的表最大的不同是它一定是分区的，也就是表中的所有记录都会依据相关算法打散，分布到所有的segment当中，从而在充分利用硬件资源的同时，最大化访问数据的IO，这种特性对于数据仓库应用是非常有帮助的。GP提供两种打散数据的算法，一种是HASH算法，参见例子一，在定义表的时候，通过distributed by指定表中的某个列或者某个列的组合作为HASH键，相同HASH键的记录会放在同一个SEGMENT当中。所以，GP建议一般选择记录分布均匀的键作为HASH键使用，从而保证表中的记录可以均匀分布到所有SEGMENT上。如果表上定义了主键或者唯一键，则这些键值列必须作前导列出现在分布键当中。假如例子一的PROD_ID是主键或者唯一键，那么它必须出现在HASH键中，并且放在第一位。 如果定义表的时候，没有指定distributed子句，系统使用第一个列作为HASH键使用。另一种数据打散的算法是平均分配法（ROUND-ROBIN），参见例子二, 假设有三个段，那么这种算法会把第一条记录放在段1, 第二条记录放在段2，第三条记录放在段3，第四条记录放在段四，以此类推，直到所有记录发放完为止。这种算法比较适合表中的字段存在严重数据倾斜的情况。
+
+
+    在数据仓库中，对于存储海量少变化历史数据的事实表的访问，会产生大量IO。这些表除了记录多外（纵向），同时也很宽。比如几十列，甚至上百列的表也很常见。但是在进行数据分析和挖掘过程中，我们可能只用到这些列的很小一部分内容，而传统的按行存储的表，在访问时总是会访问记录中的所有列，导致很多无效IO，当由于表横向尺寸过大，按行存储的表还会出现行链接，这会使无效IO的问题更严重。在GP中，对于这种情况应该考虑使用面向列存储的AOT表，从而大幅高IO效率，获取数据查询性能的收益。下面是AOT表定义的例子。
+例子三
+CREATE TABLE SALES 
+   (PROD_ID numeric NOT NULL , 
+    CUST_ID numeric NOT NULL , 
+    TIME_ID DATE NOT NULL , 
+    CHANNEL_ID numeric NOT NULL , 
+    PROMO_ID numeric NOT NULL , 
+    QUANTITY_SOLD numeric(10,2) NOT NULL , 
+    AMOUNT_SOLD numeric(10,2) NOT NULL)
+    WITH (appendonly=true,orientation=column,compresstype=zlib,COMPRESSLEVEL=5)
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id);
+    
+例子四
+CREATE TABLE SALES 
+   (PROD_ID numeric NOT NULL , 
+    CUST_ID numeric NOT NULL , 
+    TIME_ID DATE NOT NULL , 
+    CHANNEL_ID numeric NOT NULL , 
+    PROMO_ID numeric NOT NULL , 
+    QUANTITY_SOLD numeric(10,2) NOT NULL , 
+    AMOUNT_SOLD numeric(10,2) NOT NULL)
+    WITH (appendonly=true,orientation=column,compresstype=QUICKLZ,COMPRESSLEVEL=1)
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id);
+
+    现在硬件系统往往IO效率跟不上CPU处理的速度，而数据仓库应用恰恰是IO敏感型的应用，所以很多数据仓库系统上，我会看到CPU很闲，但是出现大量IO等待的情况。所以通过压缩，尤其是面向列压缩，允许我们牺牲一定的CPU效率进一步换取IO效率，提高系统的的吞吐量。GP的AOT表允许使用两种压缩算法，一种是ZLIB，它的压缩率较高，对CPU的消耗较多，GP中可以指定1到9 9个级别。1的压缩比最小，9最大，参见例子三。另一种算法是QUICKLZ，它的压缩比小，这能设置1，造成的CPU负载也比ZLIB小。
+     AOT表虽然查询和加载数据的效率很高，但是如它的名字那样它只能支持SELECT，INSERT，truncate操作，不支持UPDATE和DELETE操作。所以它只适合存放经过处理基本最终无变化的历史数据，用来提供高效的查询访问。
+     
+     从数据数据存放的生命周期看，前面介绍的表都称之为永久表，这些表的记录不会因为事务的结束和会话的断开而消失。而业务中，我们经常要使用到临时数据集合，如果用永久表存放中间结果，一方面是在并发环境中数据不安全，另一方面频繁的删除表中的记录或者删除表，会导致大量碎片，在字典层面造成瓶颈。因此GP也支持临时表，不同连接共享相同的表结构。比如下面的两个例子。
+例子五
+CREATE TEMP TABLE SALES_TMP 
+  (PROD_ID numeric NOT NULL , 
+         CUST_ID numeric NOT NULL , 
+         TIME_ID DATE NOT NULL , 
+         CHANNEL_ID numeric NOT NULL , 
+         PROMO_ID numeric NOT NULL , 
+         QUANTITY_SOLD numeric(10,2) NOT NULL , 
+         AMOUNT_SOLD numeric(10,2) NOT NULL)
+         on commit preserve rows
+distributed randomly;
+
+例子六
+CREATE TEMP TABLE SALES
+  (PROD_ID numeric NOT NULL , 
+         CUST_ID numeric NOT NULL , 
+         TIME_ID DATE NOT NULL , 
+         CHANNEL_ID numeric NOT NULL , 
+         PROMO_ID numeric NOT NULL , 
+         QUANTITY_SOLD numeric(10,2) NOT NULL , 
+         AMOUNT_SOLD numeric(10,2) NOT NULL)
+         on commit delete rows
+distributed by (prod_id,cust_id,time_id,channel_id,promo_id);
+
+    例子五是事务内有效，连接会话间数据独立。完成事务后数据保留，只有连接会话断开后数据才消失。例子六是事务内有效，也就是提交事务后（commit）数据就会消失。如果临时表的名字与永久表名字重复，临时表的访问优先。
+    除了普通表以外，GP还支持超大表进行分区应用，为我们的提高数据访问效率的同时，也提高应用的灵活型。它可以支持RANGE分区，LIST分区，以及灵活的复合分区（RANGE-LIST,RANGE-RANGE,LIST-RANGE,LIST-LIST,以及更多层次的分区，比如三层分区),GP的分区是基于SEGMENT基础之上的。每个分区的数据同样会打散分布到每个segment中，当WHERE条件上出现分区键时，它会进行分区裁剪，减少IO。需要注意的是，目前GREENPLUM还只支持静态分区裁剪，所以如果希望用到分区裁剪，请在WHERE条件中使用事实表的分区键作为条件。
+    
+例子七 使用LIST分区
+  CREATE TABLE SALES
+   (PROD_ID numeric NOT NULL , 
+    CUST_ID numeric NOT NULL , 
+    TIME_ID DATE NOT NULL , 
+    CHANNEL_ID numeric NOT NULL , 
+    PROMO_ID numeric NOT NULL , 
+    QUANTITY_SOLD numeric(10,2) NOT NULL , 
+    AMOUNT_SOLD numeric(10,2) NOT NULL)
+    WITH (appendonly=true,orientation=column,compresstype=QUICKLZ,COMPRESSLEVEL=1)
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id)
+    partition by list (channel_id)
+    ( partition c_1 values (2, 4),
+      partition c_2 values (3,9),
+     default partition other);
+  
+例子八
+---使用RANGE分区
+   CREATE TABLE SALES 
+   (PROD_ID numeric NOT NULL , 
+    CUST_ID numeric NOT NULL , 
+    TIME_ID DATE NOT NULL , 
+    CHANNEL_ID numeric NOT NULL , 
+    PROMO_ID numeric NOT NULL , 
+    QUANTITY_SOLD numeric(10,2) NOT NULL , 
+    AMOUNT_SOLD numeric(10,2) NOT NULL)
+    WITH (appendonly=true,orientation=column,compresstype=QUICKLZ,COMPRESSLEVEL=1)
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id)
+    partition by range(time_id)
+    ( START (date '1998-01-01') INCLUSIVE
+      END (date '2001-12-31') EXCLUSIVE
+      EVERY (INTERVAL '1 year'), DEFAULT PARTITION other);
+  
+---每个分区独立定义
+   CREATE TABLE SALES 
+   (PROD_ID numeric NOT NULL , 
+    CUST_ID numeric NOT NULL , 
+    TIME_ID DATE NOT NULL , 
+    CHANNEL_ID numeric NOT NULL , 
+    PROMO_ID numeric NOT NULL , 
+    QUANTITY_SOLD numeric(10,2) NOT NULL , 
+    AMOUNT_SOLD numeric(10,2) NOT NULL)
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id)
+    partition by range(time_id)
+    (PARTITION FY1998 START (date '1998-01-01') INCLUSIVE ,
+     PARTITION FY1999 START (date '1999-01-01') INCLUSIVE ,
+     PARTITION FY2000 START (date '2000-01-01') INCLUSIVE ,
+     PARTITION FY2001 START (date '2001-01-01') INCLUSIVE ,
+     DEFAULT PARTITION extra);
+
+例子九 
+--使用复合分区方式 RANGE-LIST 
+   CREATE TABLE SALES
+      (PROD_ID numeric NOT NULL , 
+       CUST_ID numeric NOT NULL , 
+       TIME_ID DATE NOT NULL , 
+       CHANNEL_ID numeric NOT NULL , 
+       PROMO_ID numeric NOT NULL , 
+       QUANTITY_SOLD numeric(10,2) NOT NULL , 
+       AMOUNT_SOLD numeric(10,2) NOT NULL)
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id)
+    partition by range(time_id)
+    SUBPARTITION BY LIST(channel_id)
+    SUBPARTITION TEMPLATE
+    ( subpartition c_1 values (2, 4),
+      subpartition c_2 values (3,9),
+      default subpartition other_1)
+    ( START (date '1998-01-01') INCLUSIVE
+      END (date '2001-12-31') EXCLUSIVE
+      EVERY (INTERVAL '1 year'), DEFAULT PARTITION other_2);
+  
+
+--使用复合分区方式LIST-RANGE 
+CREATE TABLE SALES
+      (PROD_ID numeric NOT NULL , 
+       CUST_ID numeric NOT NULL , 
+       TIME_ID DATE NOT NULL , 
+       CHANNEL_ID numeric NOT NULL , 
+       PROMO_ID numeric NOT NULL , 
+       QUANTITY_SOLD numeric(10,2) NOT NULL , 
+       AMOUNT_SOLD numeric(10,2) NOT NULL)
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id)
+    PARTITION BY LIST(channel_id)
+    subpartition by range(time_id)    
+    SUBPARTITION TEMPLATE
+     ( START (date '1998-01-01') INCLUSIVE
+      END (date '2001-12-31') EXCLUSIVE
+      EVERY (INTERVAL '1 year'), DEFAULT SUBPARTITION other_2)
+    ( partition c_1 values (2, 4),
+      partition c_2 values (3,9),
+      default partition other_1);
+   
+--使用复合分区方式RANGE-RANGE 
+CREATE TABLE SALES
+      (PROD_ID numeric NOT NULL , 
+       CUST_ID numeric NOT NULL , 
+       TIME_ID DATE NOT NULL , 
+       YEAR    INT ,
+       MON     INT,
+       CHANNEL_ID numeric NOT NULL , 
+       PROMO_ID numeric NOT NULL , 
+       QUANTITY_SOLD numeric(10,2) NOT NULL , 
+       AMOUNT_SOLD numeric(10,2) NOT NULL)
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id)
+    PARTITION BY RANGE (year)
+    subpartition by range(mon)    
+     SUBPARTITION TEMPLATE (
+     START (1) INCLUSIVE END (13) EXCLUSIVE EVERY (1),
+     DEFAULT SUBPARTITION other_months )
+    ( START (1998) INCLUSIVE END (2001) INCLUSIVE EVERY (1),
+      DEFAULT PARTITION OTHER_years );
+      
+--使用复合分区方式 LIST-LIST
+CREATE TABLE SALES
+      (PROD_ID numeric NOT NULL , 
+       CUST_ID numeric NOT NULL , 
+       TIME_ID DATE NOT NULL , 
+       YEAR    INT ,
+       MON     INT,
+       CHANNEL_ID numeric NOT NULL , 
+       PROMO_ID numeric NOT NULL , 
+       QUANTITY_SOLD numeric(10,2) NOT NULL , 
+       AMOUNT_SOLD numeric(10,2) NOT NULL)
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id)
+    PARTITION BY LIST (year)
+    subpartition by LIST(mon)    
+     SUBPARTITION TEMPLATE (
+      subpartition Q_1 values (1，2, 3),
+      subpartition Q_2 values (4，5, 6),
+      subpartition Q_3 values (7，8, 9),
+      subpartition Q_4 values (10，11, 12),
+       DEFAULT SUBPARTITION other_months )         
+    ( partition Y_1 values (1998),
+      partition Y_2 values (1999),
+      partition Y_3 values (2000),
+      partition Y_4 values (2001),
+      DEFAULT PARTITION OTHER_years );
+
+--三层复合分区，RANGE-RANGE-LIST
+    CREATE TABLE SALES
+      (PROD_ID numeric NOT NULL , 
+       CUST_ID numeric NOT NULL , 
+       TIME_ID DATE NOT NULL , 
+       YEAR    INT ,
+       MON     INT,
+       CHANNEL_ID numeric NOT NULL , 
+       PROMO_ID numeric NOT NULL , 
+       QUANTITY_SOLD numeric(10,2) NOT NULL , 
+       AMOUNT_SOLD numeric(10,2) NOT NULL)
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id)
+    PARTITION BY RANGE (year)
+    subpartition by range(mon)    
+     SUBPARTITION TEMPLATE (
+     START (1) INCLUSIVE END (13) EXCLUSIVE EVERY (1),
+     DEFAULT SUBPARTITION other_months )    
+    subpartition by list (channel_id)
+    SUBPARTITION TEMPLATE
+    ( subpartition c_1 values (2, 4),
+      subpartition c_2 values (3,9),
+      default subpartition other_1)
+      ( START (1998) INCLUSIVE END (2001) INCLUSIVE EVERY (1),
+      DEFAULT PARTITION OTHER_years );
+
+例子十 分区表的分区可以使用不同的存储属性，既可以面向行，也可以面向列
+CREATE TABLE SALES
+   (PROD_ID numeric NOT NULL , 
+    CUST_ID numeric NOT NULL , 
+    TIME_ID DATE NOT NULL , 
+    CHANNEL_ID numeric NOT NULL , 
+    PROMO_ID numeric NOT NULL , 
+    QUANTITY_SOLD numeric(10,2) NOT NULL , 
+    AMOUNT_SOLD numeric(10,2) NOT NULL)
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id)
+    partition by range(time_id)
+    (PARTITION FY1998 START (date '1998-01-01') INCLUSIVE WITH (appendonly=true,orientation=column,compresstype=zlib,COMPRESSLEVEL=5),
+     PARTITION FY1999 START (date '1999-01-01') INCLUSIVE WITH (appendonly=true,orientation=column,compresstype=zlib,COMPRESSLEVEL=5),
+     PARTITION FY2000 START (date '2000-01-01') INCLUSIVE WITH (appendonly=true,orientation=column,compresstype=zlib,COMPRESSLEVEL=5),
+     PARTITION FY2001 START (date '2001-01-01') INCLUSIVE ,
+     DEFAULT PARTITION extra);
+
+例子十一 分区表可以以其它表为模板复制表结构
+
+CREATE TABLE SALES2 (like sales)  
+    distributed by (prod_id,cust_id,time_id,channel_id,promo_id)
+    partition by range(time_id)
+    (PARTITION FY1998 START (date '1998-01-01') INCLUSIVE WITH (appendonly=true,orientation=column,compresstype=zlib,COMPRESSLEVEL=5),
+     PARTITION FY1999 START (date '1999-01-01') INCLUSIVE WITH (appendonly=true,orientation=column,compresstype=zlib,COMPRESSLEVEL=5),
+     PARTITION FY2000 START (date '2000-01-01') INCLUSIVE WITH (appendonly=true,orientation=column,compresstype=zlib,COMPRESSLEVEL=5),
+     PARTITION FY2001 START (date '2001-01-01') INCLUSIVE ,
+     DEFAULT PARTITION extra);
+     
+
+    从数据存放的角度看，前面介绍的表数据都存储在数据库内。GP也支持外部表，也就是数据以平面文件形式存放在数据库外，在数据库内以表的访问形式来访问这些平面文件的数据。GP的外部表与其它数据库的外部表有两个重要的不同之处。一个是GP的外部表不必放在数据库服务器上，它可以独立存放在ETL服务器或者文件服务器上，而且不必集中存放，比如有多个文件，那么可以分组放到不同的文件服务器上，这样可以大幅提升海量数据的IO处理速度，从而提高数据加载效率。另一个不同之处是，从4.0开始，GP不但支持可读外部表，还支持可写外部表。这样我们可以把GP中的数据快速卸载成平面文件。因此，外部表是GP与其它外部数据源进行数据交换的最终要手段之一，同时也是最高效的手段。
+
+例子十二，这是一个只读外部表的例子,它读取的文件分布在四台机器上（如何启动gpfdist服务，参见手册或者文章http://www.itpub.net/viewthread.php?tid=1410982），这些文件使用CSV格式，使用分割符'|'，使用'"'作为第二分割符，并跳过文件的首行,文本中使用的字符集是GBK（系统会自动转换成服务端字符集，比如UTF8),如果记录格式有问题，跳过，并写入错误表err_sales_ext(如果错误表不存在，建外部表时系统自动创建),格式有问题的记录最多允许7000000条
+create external table sales_ext1
+(PROD_ID numeric, 
+CUST_ID numeric, 
+TIME_ID DATE, 
+CHANNEL_ID numeric , 
+PROMO_ID numeric , 
+QUANTITY_SOLD numeric(10,2), 
+AMOUNT_SOLD numeric(10,2))
+LOCATION ('gpfdist://etlhost-1:8081/sales/*','gpfdist://etlhost-2:8081/sales/*','gpfdist://etlhost-3:8081/sales/*','gpfdist://etlhost-4:8081/sales/*')
+FORMAT 'CSV'(header DELIMITER '|' QUOTE '"')
+encoding 'GBK'
+log errors into err_sales_ext segment reject limit 7000000 rows;
+
+可读外部表只能查询，不能进行DML操作，也不支持索引。
+
+例子十三，这是一个可写外部表的例子，它可以把查询结果写入到指定CSV格式文件中。
+create writable external table sales_ext_w
+(PROD_ID numeric, 
+CUST_ID numeric, 
+TIME_ID DATE, 
+CHANNEL_ID numeric , 
+PROMO_ID numeric , 
+QUANTITY_SOLD numeric(10,2), 
+AMOUNT_SOLD numeric(10,2))
+LOCATION ('gpfdist://md:8081/sales/sales.csv','gpfdist://etlhost-2:8081/sales/sales.csv','gpfdist://etlhost-3:8081/sales/sales.csv','gpfdist://etlhost-4:8081/sales/sales.csv')
+FORMAT 'CSV'(DELIMITER '|' QUOTE '"')
+encoding 'GBK'
+distributed by (prod_id,cust_id,time_id,channel_id,promo_id);
+
+可写外部表只支持insert操作，不支持DELETE,UPDATE,SELECT ,TRUNCATE , 插入的数据是以追加方式写入文件。
+
+外部表也可以通过WEB server，使用HTTP协议访问数据,或者使用系统命令获取数据，这种形式的外部表也有可写外部表。
+例子十四 
+create external web table sales_ext1
+(PROD_ID numeric, 
+CUST_ID numeric, 
+TIME_ID DATE, 
+CHANNEL_ID numeric , 
+PROMO_ID numeric , 
+QUANTITY_SOLD numeric(10,2), 
+AMOUNT_SOLD numeric(10,2))
+LOCATION ('http://etlhost-1:8081/sales/*','http://etlhost-2:8081/sales/*','http://etlhost-3:8081/sales/*','http://etlhost-4:8081/sales/*')
+FORMAT 'CSV'(header DELIMITER '|' QUOTE '"')
+encoding 'GBK'
+log errors into err_sales_ext segment reject limit 7000000 rows;
+
+
+例子十五，需要以超级管理员身份执行，并且所有节点都有comm.sh的脚本
+create external web table sales_ext1
+(PROD_ID numeric, 
+CUST_ID numeric, 
+TIME_ID DATE, 
+CHANNEL_ID numeric , 
+PROMO_ID numeric , 
+QUANTITY_SOLD numeric(10,2), 
+AMOUNT_SOLD numeric(10,2))
+execute 'comm.sh' on all
+FORMAT 'CSV'(header DELIMITER '|' QUOTE '"')
+encoding 'GBK'
+log errors into err_sales_ext segment reject limit 7000000 rows;
+
+
+更多的建表选项，大家可以参考GREENPLUM的管理员手册。
+ 
